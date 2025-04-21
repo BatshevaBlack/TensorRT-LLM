@@ -13,7 +13,9 @@ from tensorrt_llm.llmapi import (LLM, BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
-                                              parse_disagg_config_file)
+                                              MetadataServerConfig,
+                                              parse_disagg_config_file,
+                                              parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
@@ -81,7 +83,8 @@ def get_llm_args(model: str,
     return llm_args
 
 
-def launch_server(host: str, port: int, llm_args: dict):
+def launch_server(host: str, port: int, llm_args: dict,
+                  metadata_server_cfg: MetadataServerConfig):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
@@ -91,7 +94,9 @@ def launch_server(host: str, port: int, llm_args: dict):
     else:
         llm = LLM(**llm_args)
 
-    server = OpenAIServer(llm=llm, model=model)
+    server = OpenAIServer(llm=llm,
+                          model=model,
+                          metadata_server_cfg=metadata_server_cfg)
 
     asyncio.run(server(host, port))
 
@@ -173,6 +178,10 @@ def launch_server(host: str, port: int, llm_args: dict):
     help=
     "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
 )
+@click.option("--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
 def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           log_level: str, backend: str, max_beam_width: int,
           max_batch_size: int, max_num_tokens: int, max_seq_len: int,
@@ -180,7 +189,8 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           gpus_per_node: Optional[int],
           kv_cache_free_gpu_memory_fraction: float,
           num_postprocess_workers: int, trust_remote_code: bool,
-          extra_llm_api_options: Optional[str]):
+          extra_llm_api_options: Optional[str],
+          metadata_server_config_file: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -209,7 +219,10 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         trust_remote_code=trust_remote_code,
         **llm_args_dict)
 
-    launch_server(host, port, llm_args)
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    launch_server(host, port, llm_args, metadata_server_cfg)
 
 
 def get_ctx_gen_server_urls(
@@ -231,6 +244,11 @@ def get_ctx_gen_server_urls(
               type=str,
               default=None,
               help="Specific option for disaggregated mode.")
+@click.option("-m",
+              "--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
 @click.option("-t",
               "--server_start_timeout",
               type=int,
@@ -241,8 +259,9 @@ def get_ctx_gen_server_urls(
               type=int,
               default=180,
               help="Request timeout")
-def disaggregated(config_file: Optional[str], server_start_timeout: int,
-                  request_timeout: int):
+def disaggregated(config_file: Optional[str],
+                  metadata_server_config_file: Optional[str],
+                  server_start_timeout: int, request_timeout: int):
     """Running server in disaggregated mode"""
 
     disagg_cfg = parse_disagg_config_file(config_file)
@@ -250,12 +269,16 @@ def disaggregated(config_file: Optional[str], server_start_timeout: int,
     ctx_server_urls, gen_server_urls = get_ctx_gen_server_urls(
         disagg_cfg.server_configs)
 
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
     server = OpenAIDisaggServer(ctx_servers=ctx_server_urls,
                                 gen_servers=gen_server_urls,
                                 req_timeout_secs=request_timeout,
                                 server_start_timeout_secs=server_start_timeout,
                                 ctx_router_type=disagg_cfg.ctx_router_type,
-                                gen_router_type=disagg_cfg.gen_router_type)
+                                gen_router_type=disagg_cfg.gen_router_type,
+                                metadata_server_cfg=metadata_server_cfg)
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 
