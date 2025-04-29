@@ -1,8 +1,13 @@
 import asyncio
 import heapq
+import os
+import socket
+import json
+import aiohttp
 from abc import ABC, abstractmethod
-from typing import List, Union
+from typing import Dict, List, Optional, Union
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
@@ -71,8 +76,28 @@ class Router(ABC):
     def __init__(self,
                  servers: List[str] = None,
                  metadata_server: JsonDictionary = None):
-        self._servers = servers
+        self._servers = servers or []
         self._metadata_server = metadata_server
+        self._monitor_task = None
+        self._lock = asyncio.Lock()
+        self._session = None
+        # Default timeout for health checks (in seconds)
+        self._health_check_timeout = 5.0
+        logger.debug(f"Initialized Router with default health check timeout: {self._health_check_timeout}s")
+        
+        # Create a persistent session for health checks
+        self._init_session()
+    
+    def _init_session(self):
+        """Initialize the HTTP session for health checks"""
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+            
+    async def close_session(self):
+        """Close the HTTP session"""
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
 
     @abstractmethod
     async def get_next_server(
@@ -99,21 +124,109 @@ class Router(ABC):
             except asyncio.CancelledError:
                 pass
             self._monitor_task = None
+        
+        # Close session when stopping monitoring
+        await self.close_session()
 
     async def _monitor_servers(self, poll_interval: int = 10):
         """Monitor servers update from metadata service"""
         while True:
-            new_servers = await self.fetch_live_servers()
-
-            async with self._lock:
-                if new_servers != self._servers:
-                    self._servers = new_servers
+            if self._metadata_server:
+                # Get servers from metadata
+                server_key_map = await self.fetch_live_servers()
+                
+                # Check health and get live servers
+                live_servers = await self.check_servers_health(server_key_map)
+                
+                async with self._lock:
+                    if live_servers != self._servers:
+                        self._servers = live_servers
 
             await asyncio.sleep(poll_interval)
 
-    async def fetch_live_servers(self) -> List[str]:
-        """Fetch current list of healthy servers from metadata service
-           If use etcd, we can use the watch method to get the update."""
+    async def fetch_live_servers(self) -> Dict[str, str]:
+        """Fetch all servers from metadata service and return {url: key} mapping"""
+        if not self._metadata_server:
+            return {server: "" for server in self._servers}
+
+        server_key_map = {}
+        try:
+            # Get all keys from the metadata server
+            all_keys = self._metadata_server.keys()
+
+            # Filter keys that start with 'trtllm/' and extract server metadata
+            for key in all_keys:
+                if key.startswith('trtllm/'):
+                    server_metadata = self._metadata_server.get(key)
+                    if server_metadata and isinstance(server_metadata, dict) and 'url' in server_metadata:
+                        server_key_map[server_metadata['url']] = key
+                        
+                        # Check if metadata includes health check timeout
+                        if 'health_check_timeout' in server_metadata:
+                            try:
+                                self._health_check_timeout = float(server_metadata['health_check_timeout'])
+                                logger.debug(f"Using health check timeout: {self._health_check_timeout}s")
+                            except (ValueError, TypeError):
+                                logger.warning(f"Invalid health_check_timeout value: {server_metadata['health_check_timeout']}")
+            
+        except Exception as e:
+            logger.error(f"Error fetching servers from metadata service: {e}")
+
+        return server_key_map
+
+    async def check_servers_health(self, server_key_map: Dict[str, str]) -> List[str]:
+        """Check health of servers and remove dead ones from metadata service"""
+        live_servers = []
+        dead_servers = []
+        
+        try:
+            # Check health of each server
+            for server_url in server_key_map:
+                # First attempt - no printing errors
+                is_healthy = await self._check_server_health(server_url, silent=True)
+                
+                # If first attempt failed, try again before declaring server dead
+                if not is_healthy:
+                    # Second attempt - will print errors if it fails
+                    is_healthy = await self._check_server_health(server_url, silent=False)
+                    
+                    if not is_healthy:
+                        # Only now add to dead servers
+                        dead_servers.append(server_url)
+                        logger.warning(f"Server {server_url} is not healthy after retry - removing")
+                    else:
+                        live_servers.append(server_url)
+                else:
+                    live_servers.append(server_url)
+            
+            # Remove dead servers from etcd
+            for dead_server in dead_servers:
+                etcd_key = server_key_map.get(dead_server)
+                if etcd_key:
+                    try:
+                        logger.info(f"Removing dead server {dead_server} from metadata server")
+                        self._metadata_server.remove(etcd_key)
+                    except Exception as e:
+                        logger.error(f"Error removing dead server from metadata service: {e}")
+            
+        except Exception as e:
+            logger.error(f"Error checking server health: {e}")
+
+        return live_servers if live_servers else self._servers
+        
+    async def _check_server_health(self, server_url, silent=False) -> bool:
+        """Check if a server is healthy by querying its health endpoint"""
+        try:
+            async with self._session.get(f"{server_url}/health", timeout=self._health_check_timeout) as response:
+                if response.status != 200:
+                    if not silent:
+                        logger.warning(f"Server {server_url} is not healthy (status: {response.status})")
+                    return False
+                return True
+        except Exception as e:
+            if not silent:
+                logger.warning(f"Server {server_url} is not reachable: {e}")
+            return False
 
 
 class RoundRobinRouter(Router):

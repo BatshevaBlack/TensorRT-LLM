@@ -94,7 +94,8 @@ def register_server_with_etcd(
     executor_id: str,
     server_type: str,
     url: str,
-    model_info: Optional[Dict[str, Any]] = None
+    model_info: Optional[Dict[str, Any]] = None,
+    health_check_timeout: Optional[float] = None
 ) -> str:
     """
     Register a server with ETCD and return the registration key
@@ -105,6 +106,7 @@ def register_server_with_etcd(
         server_type: The type of server ('ctx' or 'gen')
         url: The server URL
         model_info: Optional model information
+        health_check_timeout: Optional timeout for health checks (in seconds)
 
     Returns:
         The key used for registration
@@ -124,6 +126,10 @@ def register_server_with_etcd(
         "hostname": hostname,
         "pid": pid
     }
+
+    # Add health check timeout if provided
+    if health_check_timeout is not None:
+        metadata["health_check_timeout"] = health_check_timeout
 
     # Add model info if provided
     if model_info:

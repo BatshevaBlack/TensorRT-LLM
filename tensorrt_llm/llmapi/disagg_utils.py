@@ -39,6 +39,7 @@ class MetadataServerConfig():
     server_type: Literal['etcd']
     hostname: str = "localhost"
     port: int = 2379
+    health_check_timeout: float = 5.0
 
 
 def parse_disagg_config_file(yaml_config_file: str):
@@ -91,11 +92,20 @@ def extract_disagg_cfg(hostname: str = 'localhost',
             url = urls[0]  # Take the first URL
             if ':' in url:
                 hostname, port_str = url.split(':')
-                etcd_config = MetadataServerConfig(
-                    server_type='etcd',
-                    hostname=hostname,
-                    port=int(port_str)
-                )
+                # Only include health_check_timeout if explicitly specified
+                if 'health_check_timeout' in etcd_server:
+                    etcd_config = MetadataServerConfig(
+                        server_type='etcd',
+                        hostname=hostname,
+                        port=int(port_str),
+                        health_check_timeout=etcd_server['health_check_timeout']
+                    )
+                else:
+                    etcd_config = MetadataServerConfig(
+                        server_type='etcd',
+                        hostname=hostname,
+                        port=int(port_str)
+                    )
 
     return DisaggServerConfig(server_configs, hostname, port, ctx_router_type,
                               gen_router_type, etcd_config)
@@ -222,4 +232,14 @@ def parse_metadata_server_config_file(
 
     with open(metadata_server_config_file, 'r') as file:
         config = yaml.safe_load(file)
-        return MetadataServerConfig(**config)
+        # Create config without explicitly passing health_check_timeout unless it's in the file
+        if 'health_check_timeout' not in config:
+            # Use default value by not specifying it
+            return MetadataServerConfig(
+                server_type=config.get('server_type', 'etcd'),
+                hostname=config.get('hostname', 'localhost'),
+                port=config.get('port', 2379)
+            )
+        else:
+            # Include explicitly specified health_check_timeout
+            return MetadataServerConfig(**config)

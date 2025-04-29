@@ -364,12 +364,18 @@ def disaggregated_mpi_worker(config_file: Optional[str],
                 server_url = f"http://{server_cfg.hostname}:{server_cfg.port}"
                 executor_id = f"{server_cfg.type}_server_{instance_idx}"
 
-                etcd_key = register_server_with_etcd(
-                    metadata_server=metadata_server,
-                    executor_id=executor_id,
-                    server_type=server_cfg.type,
-                    url=server_url
-                )
+                # Always include health_check_timeout in the registration
+                # Use the value from etcd_config if it was explicitly set, otherwise use default (5.0)
+                # We don't need to check if it was explicitly specified, we'll pass it either way
+                register_args = {
+                    "metadata_server": metadata_server,
+                    "executor_id": executor_id,
+                    "server_type": server_cfg.type,
+                    "url": server_url,
+                    "health_check_timeout": getattr(etcd_config, "health_check_timeout", 5.0)
+                }
+                
+                etcd_key = register_server_with_etcd(**register_args)
 
                 logger.info(f"Registered server with ETCD: {etcd_key}")
 
