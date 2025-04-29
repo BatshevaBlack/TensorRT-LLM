@@ -1,5 +1,6 @@
 import asyncio
 import os
+import socket
 from typing import Any, List, Optional
 
 import click
@@ -19,6 +20,7 @@ from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+from tensorrt_llm.serve.metadata_server import create_metadata_server, register_server_with_etcd
 
 
 def get_llm_args(model: str,
@@ -269,8 +271,13 @@ def disaggregated(config_file: Optional[str],
     ctx_server_urls, gen_server_urls = get_ctx_gen_server_urls(
         disagg_cfg.server_configs)
 
+    # Set up metadata server config - first check explicit config file, then check ETCD in the disagg config
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
+
+    # If no metadata config file provided, check if there's ETCD config in the disagg config file
+    if metadata_server_cfg is None and hasattr(disagg_cfg, 'etcd_config'):
+        metadata_server_cfg = disagg_cfg.etcd_config
 
     server = OpenAIDisaggServer(ctx_servers=ctx_server_urls,
                                 gen_servers=gen_server_urls,
@@ -303,7 +310,17 @@ def set_cuda_device():
               type=str,
               default=None,
               help="Specific option for disaggregated mode.")
-def disaggregated_mpi_worker(config_file: Optional[str]):
+@click.option("--etcd_host",
+              type=str,
+              default=None,
+              help="ETCD host for service registration (optional)")
+@click.option("--etcd_port",
+              type=int,
+              default=2379,
+              help="ETCD port for service registration (optional)")
+def disaggregated_mpi_worker(config_file: Optional[str],
+                            etcd_host: Optional[str],
+                            etcd_port: Optional[int]):
     """Launching disaggregated MPI worker"""
 
     set_cuda_device()
@@ -315,6 +332,17 @@ def disaggregated_mpi_worker(config_file: Optional[str]):
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     disagg_cfg = parse_disagg_config_file(config_file)
+
+    # Extract ETCD config from config file if available
+    etcd_config = None
+    if hasattr(disagg_cfg, 'etcd_config') and disagg_cfg.etcd_config:
+        etcd_config = disagg_cfg.etcd_config
+    elif etcd_host:
+        etcd_config = MetadataServerConfig(
+            server_type='etcd',
+            hostname=etcd_host,
+            port=etcd_port
+        )
 
     is_leader, instance_idx, sub_comm = split_world_comm(
         disagg_cfg.server_configs)
@@ -329,6 +357,22 @@ def disaggregated_mpi_worker(config_file: Optional[str]):
     if is_leader:
         server_cfg = disagg_cfg.server_configs[instance_idx]
 
+        # Register with ETCD if configuration is available
+        if etcd_config:
+            metadata_server = create_metadata_server(etcd_config)
+            if metadata_server:
+                server_url = f"http://{server_cfg.hostname}:{server_cfg.port}"
+                executor_id = f"{server_cfg.type}_server_{instance_idx}"
+
+                etcd_key = register_server_with_etcd(
+                    metadata_server=metadata_server,
+                    executor_id=executor_id,
+                    server_type=server_cfg.type,
+                    url=server_url
+                )
+
+                logger.info(f"Registered server with ETCD: {etcd_key}")
+
         llm_args = get_llm_args(**server_cfg.other_args)
 
         mpi_session = MpiCommSession(
@@ -339,7 +383,8 @@ def disaggregated_mpi_worker(config_file: Optional[str]):
 
         launch_server(host=server_cfg.hostname,
                       port=server_cfg.port,
-                      llm_args=llm_args)
+                      llm_args=llm_args,
+                      metadata_server_cfg=etcd_config)
     else:
         with MPICommExecutor(sub_comm) as executor:
             if not is_leader and executor is not None:

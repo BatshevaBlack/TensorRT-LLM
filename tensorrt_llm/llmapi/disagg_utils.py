@@ -31,6 +31,7 @@ class DisaggServerConfig():
     port: int = 8000
     ctx_router_type: str = "round_robin"
     gen_router_type: str = "round_robin"
+    etcd_config: Optional['MetadataServerConfig'] = None
 
 
 @dataclass
@@ -55,6 +56,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        port: int = 8000,
                        context_servers: dict = {},
                        generation_servers: dict = {},
+                       etcd_server: Optional[dict] = None,
                        **kwargs: Any) -> DisaggServerConfig:
 
     # If parameters are specified outside the context_severs and generation_servers sections,
@@ -80,8 +82,23 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     ctx_router_type = context_servers.get("router_type", "round_robin")
     gen_router_type = generation_servers.get("router_type", "round_robin")
 
+    # Parse ETCD configuration if provided
+    etcd_config = None
+    if etcd_server:
+        # Process the etcd_server section
+        urls = etcd_server.get('urls', [])
+        if urls and len(urls) > 0:
+            url = urls[0]  # Take the first URL
+            if ':' in url:
+                hostname, port_str = url.split(':')
+                etcd_config = MetadataServerConfig(
+                    server_type='etcd',
+                    hostname=hostname,
+                    port=int(port_str)
+                )
+
     return DisaggServerConfig(server_configs, hostname, port, ctx_router_type,
-                              gen_router_type)
+                              gen_router_type, etcd_config)
 
 
 def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],

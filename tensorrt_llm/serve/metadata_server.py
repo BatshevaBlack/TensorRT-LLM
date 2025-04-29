@@ -1,6 +1,8 @@
 import json
+import os
+import socket
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Dict, List, Optional, Any
 
 import etcd3
 
@@ -41,9 +43,6 @@ class EtcdDictionary(RemoteDictionary):
         self._client.delete(key)
 
     def keys(self) -> list[str]:
-        # TODO: Confirm the final save key format
-        # This implementation assumes that key is in the
-        # format of "trtllm/executor_name/key"
         unique_keys = set()
         for _, metadata in self._client.get_all():
             key = metadata.key.decode('utf-8')
@@ -88,3 +87,49 @@ def create_metadata_server(
         )
 
     return JsonDictionary(dict)
+
+
+def register_server_with_etcd(
+    metadata_server: JsonDictionary,
+    executor_id: str,
+    server_type: str,
+    url: str,
+    model_info: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Register a server with ETCD and return the registration key
+
+    Args:
+        metadata_server: The ETCD client to use
+        executor_id: A unique ID for this executor (e.g. 'ctx_server', 'gen_server')
+        server_type: The type of server ('ctx' or 'gen')
+        url: The server URL
+        model_info: Optional model information
+
+    Returns:
+        The key used for registration
+    """
+    if not metadata_server:
+        return None
+
+    # Create a unique key using hostname and process ID
+    hostname = socket.gethostname()
+    pid = os.getpid()
+    key = f"trtllm/{executor_id}/{hostname}+{pid}"
+
+    # Create metadata
+    metadata = {
+        "type": server_type,
+        "url": url,
+        "hostname": hostname,
+        "pid": pid
+    }
+
+    # Add model info if provided
+    if model_info:
+        metadata["model_info"] = model_info
+
+    # Register with ETCD
+    metadata_server.put(key, metadata)
+
+    return key
