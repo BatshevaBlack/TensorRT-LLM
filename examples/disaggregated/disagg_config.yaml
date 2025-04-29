@@ -20,3 +20,7 @@ generation_servers:
   pipeline_parallel_size: 1
   urls:
       - "localhost:8002"
+# ETCD server configuration for dynamic service discovery (optional)
+etcd_server:
+  urls:
+    - "localhost:2379"

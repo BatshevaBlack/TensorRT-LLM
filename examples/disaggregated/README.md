@@ -3,6 +3,29 @@
 To run TRT-LLM in disaggregated mode, you must first launch context (prefill) and generation (decode) servers using `trtllm-serve`.
 Depending on your deployment environment, this can be done in different ways.
 
+# Using ETCD for Dynamic Service Discovery
+
+## Create an ETCD Configuration File
+
+First, create a simple JSON configuration file for ETCD:
+
+```json
+{
+  "server_type": "etcd",
+  "hostname": "localhost",
+  "port": 2379
+}
+```
+
+Save this as `etcd_config.json` in your working directory.
+
+## Start an ETCD Server
+
+```bash
+# Using Docker
+docker run -d --name etcd-server -p 2379:2379 --env ALLOW_NONE_AUTHENTICATION=yes bitnami/etcd:latest
+```
+
 ## Launching context and generation servers using multiple independent `trtllm-serve` commands
 
 You can use multiple `trtllm-serve` commands to launch the context and generation servers that will be used
@@ -13,10 +36,10 @@ echo -e "pytorch_backend_config:\n  enable_overlap_scheduler: False" > extra-llm
 
 export TRTLLM_USE_UCX_KVCACHE=1
 #Context servers
-CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./extra-llm-api-config.yml &> log_ctx_0 &
-CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./extra-llm-api-config.yml &> log_ctx_1 &
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./extra-llm-api-config.yml --metadata_server_config_file etcd_config.json &> log_ctx_0 &
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./extra-llm-api-config.yml --metadata_server_config_file etcd_config.json &> log_ctx_1 &
 #Generation servers
-CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch &> log_gen_0 &
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --metadata_server_config_file etcd_config.json &> log_gen_0 &
 ```
 Once the context and generation servers are launched, you can launch the disaggregated
 server, which will accept requests from clients and do the orchestration between context
@@ -40,9 +63,13 @@ generation_servers:
   num_instances: 1
   urls:
       - "localhost:8003"
+etcd_server:
+  server_type: "etcd"
+  hostname: "localhost"
+  port: 2379
 ```
 
-Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI compatible endpoint.
+> **IMPORTANT:** When using ETCD in a distributed environment, always specify the actual hostname (`$(hostname)`) or a routable IP address in the `--host` parameter instead of `localhost`. This ensures that other machines can connect to your servers through the information registered in ETCD.
 
 ## Launching context and generation servers using MPI
 
@@ -80,6 +107,10 @@ generation_servers:
   pipeline_parallel_size: 1
   urls:
       - "localhost:8003"
+etcd_server:
+  server_type: "etcd"
+  hostname: "localhost"
+  port: 2379
 ```
 
 Once the context and generation servers are launched, you can again launch the disaggregated server with
