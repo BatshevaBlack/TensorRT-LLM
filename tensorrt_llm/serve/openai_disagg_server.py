@@ -43,24 +43,24 @@ class OpenAIDisaggServer:
                  ctx_router_type: str = "round_robin",
                  gen_router_type: str = "round_robin",
                  metadata_server_cfg: MetadataServerConfig = None):
-
-        self.ctx_servers = ctx_servers
-        self.gen_servers = gen_servers
+        self.ctx_servers = ctx_servers or []
+        self.gen_servers = gen_servers or []
         self.ctx_server_idx = 0
         self.gen_server_idx = 0
         self.metadata_server = create_metadata_server(metadata_server_cfg)
-        self.ctx_router = create_router(ctx_router_type, ctx_servers, self.metadata_server)
-        self.gen_router = create_router(gen_router_type, gen_servers, self.metadata_server)
-
-
-        if (len(self.gen_servers) == 0):
-            raise ValueError("At least one generation server must be provided")
-
-        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(ctx_servers) == 0:
-            raise ValueError("At least one context server must be provided")
+        # Create routers - they'll use metadata server if provided
+        self.ctx_router = create_router(ctx_router_type, self.ctx_servers, self.metadata_server)
+        self.gen_router = create_router(gen_router_type, self.gen_servers, self.metadata_server)
 
         # Session will be initialized in lifespan
         self.session: Optional[aiohttp.ClientSession] = None
+
+        # Validate server configuration
+        if not self.metadata_server and not gen_servers:
+            raise ValueError("At least one generation server must be provided, or metadata server must be configured")
+
+        if not self.metadata_server and os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and not ctx_servers:
+            raise ValueError("At least one context server must be provided, or metadata server must be configured")
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -69,9 +69,22 @@ class OpenAIDisaggServer:
                 connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, keepalive_timeout=300),
                 timeout=aiohttp.ClientTimeout(total=req_timeout_secs))
 
+            # Start server monitoring if using metadata server
+            if self.metadata_server:
+                logging.info("Starting server monitoring via metadata service")
+                await self.ctx_router.start_server_monitoring()
+                await self.gen_router.start_server_monitoring()
+
             logging.info("Waiting for context and generation servers to be ready")
             await self.wait_for_servers_ready(server_start_timeout_secs)
+
             yield
+
+            # Stop monitoring if using metadata server
+            if self.metadata_server:
+                await self.ctx_router.stop_server_monitoring()
+                await self.gen_router.stop_server_monitoring()
+
             await self.session.close()  # Ensure session cleanup
 
         self.app = FastAPI(lifespan=lifespan)
@@ -239,21 +252,85 @@ class OpenAIDisaggServer:
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         await uvicorn.Server(config).serve()
 
-    def get_next_server(self, servers: List[str], server_type: str) -> str:
-        """Round-robin selection of next available server"""
-        if not servers:
-            raise ValueError(f"No {server_type} servers available")
+    async def check_server_ready(self, server_url: str) -> bool:
+        try:
+            async with self.session.get(f"{server_url}/health", timeout=1) as response:
+                return response.status == 200
+        except Exception:
+            return False
 
-        # Pick context and gen servers in round-robin fashion
-        # TODO: In future, use endpoint to monitor load and pick the least loaded server
-        if server_type == "context":
-            server = servers[self.ctx_server_idx]
-            self.ctx_server_idx = (self.ctx_server_idx + 1) % len(servers)
-        else:
-            server = servers[self.gen_server_idx]
-            self.gen_server_idx = (self.gen_server_idx + 1) % len(servers)
+    async def wait_for_servers_ready(self, server_start_timeout_secs: int = 180):
+        """Wait for the context and generation servers to be ready"""
 
-        return server
+        async def are_servers_ready():
+            # If using metadata server, try to get updated server lists
+            if self.metadata_server:
+                try:
+                    ctx_servers = await self.ctx_router.fetch_live_servers()
+                    gen_servers = await self.gen_router.fetch_live_servers()
+
+                    # Update our local lists if we found any
+                    if ctx_servers:
+                        self.ctx_servers = ctx_servers
+                    if gen_servers:
+                        self.gen_servers = gen_servers
+
+                    logging.info(f"Discovered servers - Context: {len(self.ctx_servers)}, Generation: {len(self.gen_servers)}")
+                except Exception as e:
+                    logging.warning(f"Error fetching servers from metadata service: {e}")
+
+            # No generation servers found
+            if not self.gen_servers:
+                return False
+
+            # Handle benchmark mode (no context servers needed)
+            if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+                # Check if any generation server is ready
+                for server in self.gen_servers:
+                    if await self.check_server_ready(server):
+                        return True
+                return False
+
+            # Normal mode - need both context and generation servers
+            if not self.ctx_servers:
+                return False
+
+            # Check context servers
+            context_ready = False
+            for url in self.ctx_servers:
+                if await self.check_server_ready(url):
+                    context_ready = True
+                    break
+
+            if not context_ready:
+                return False
+
+            # Check generation servers
+            for url in self.gen_servers:
+                if await self.check_server_ready(url):
+                    return True
+
+            return False
+
+        try:
+            # Wait until servers are ready or timeout
+            start_time = asyncio.get_event_loop().time()
+            while not await are_servers_ready():
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed > server_start_timeout_secs:
+                    ctx_servers_str = ", ".join(self.ctx_servers) if self.ctx_servers else "None"
+                    gen_servers_str = ", ".join(self.gen_servers) if self.gen_servers else "None"
+                    raise TimeoutError(
+                        f"Timeout waiting for servers to be ready. Context servers: {ctx_servers_str}, Generation servers: {gen_servers_str}"
+                    )
+
+                logging.info("Context and generation servers are not all ready. Waiting...")
+                await asyncio.sleep(3)
+
+            logging.info("All required servers are ready")
+        except asyncio.CancelledError:
+            raise TimeoutError("Timeout waiting for context and generation servers to be ready")
+
 
     async def create_generator(self, url: str, request: Union[CompletionRequest, ChatCompletionRequest], end_point: str):
         async with self.session.post(url + end_point, json=request.model_dump(exclude_unset=True)) as response:
@@ -304,27 +381,3 @@ class OpenAIDisaggServer:
 
     async def send_chat_request(self, url: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
         return await self.send_request(url, request, "/v1/chat/completions", ChatCompletionResponse, self.create_chat_generator)
-
-    async def check_server_ready(self, server_url: str) -> bool:
-        try:
-            async with self.session.get(server_url+"/health") as response:
-                return response.status == 200
-        except Exception:
-            return False
-
-    async def wait_for_servers_ready(self, server_start_timeout_secs: int = 180):
-        async def are_servers_ready():
-            context_ready = all([await self.check_server_ready(url) for url in self.ctx_servers])
-            generation_ready = all([await self.check_server_ready(url) for url in self.gen_servers])
-            return context_ready and generation_ready
-
-        async def check_all_servers_ready():
-            while not await are_servers_ready():
-                wait_time = 3
-                logging.info("Context and generation servers are not ready. Waiting...")
-                await asyncio.sleep(wait_time)
-
-        try:
-            await asyncio.wait_for(check_all_servers_ready(), timeout=server_start_timeout_secs)
-        except asyncio.CancelledError:
-            raise TimeoutError("Timeout waiting for context and generation servers to be ready")
